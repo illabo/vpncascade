@@ -226,7 +226,12 @@ reality_sni  = ["www.grab.com", "www.straitstimes.com", "www.shopee.sg",
                 "www.rakuten.co.jp", "www.asus.com", "www.lg.com",
                 "www.lovelive-anime.jp",
                 "cdn.jsdelivr.net", "cdnjs.cloudflare.com", "unpkg.com",
-                "www.apple.com", "login.microsoftonline.com"]
+                "www.apple.com", "login.microsoftonline.com",
+                # consumer-scale services: ubiquitous, plausible from any household
+                "www.me.com", "www.office.com", "outlook.office365.com",
+                # developer infrastructure — see the note on traffic profile below
+                "www.apache.org", "downloads.apache.org", "hub.docker.com",
+                "pub.dev", "www.figma.com", "appcenter.ms"]
 
 # UpCloud — AS202053, on neither RKN list as of 2026-09, Singapore zone (no Moscow
 # transit from the Far East), and payable with an ordinary card. Credential is
@@ -336,6 +341,20 @@ reality_dest = "www.grab.com:443"
 # block page: in a list this long it is drawn rarely, and variety across the fleet
 # is worth more than every single entry being perfect.
 #
+#
+# A SECOND ROUND measured 2026-09-29, same method and control. Rejected:
+#   azurewebsites.net      apex serves nothing (000, no TLS 1.3)
+#   static.microsoft.com   unreachable
+#   vsassets.io            unreachable
+#   sentry.io              403
+#   browser.sentry-cdn.com 403, and no TLS 1.3
+#   registry-1.docker.io   404 to a bare GET (hub.docker.com is fine)
+#
+# MATCH THE POOL TO THE SITE'S TRAFFIC PROFILE. The developer-infrastructure
+# entries — apache.org, hub.docker.com, pub.dev, figma.com, appcenter.ms — are
+# plausible cover at a site where somebody writes software, and mildly odd at one
+# where nobody does. Since each site is an independent deployment anyway, trim
+# this list per site rather than shipping one pool everywhere.
 #   NOTE the SNI is fixed per exit at creation and `dest` is derived from it —
 #   they must agree, or an unauthenticated probe gets a certificate for the wrong
 #   name. Variety comes from many exits over time, not from re-masking one.
@@ -344,4 +363,9 @@ reality_sni  = ["www.grab.com", "www.straitstimes.com", "www.shopee.sg",
                 "www.rakuten.co.jp", "www.asus.com", "www.lg.com",
                 "www.lovelive-anime.jp",
                 "cdn.jsdelivr.net", "cdnjs.cloudflare.com", "unpkg.com",
-                "www.apple.com", "login.microsoftonline.com"]
+                "www.apple.com", "login.microsoftonline.com",
+                # consumer-scale services: ubiquitous, plausible from any household
+                "www.me.com", "www.office.com", "outlook.office365.com",
+                # developer infrastructure — see the note on traffic profile below
+                "www.apache.org", "downloads.apache.org", "hub.docker.com",
+                "pub.dev", "www.figma.com", "appcenter.ms"]
