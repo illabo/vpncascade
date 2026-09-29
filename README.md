@@ -17,7 +17,9 @@ No Russian node: nothing tied to your passport, nothing for RKN to order a host 
 delete. Russian sites see your home IP, which is a *better* source than a datacenter
 one — residential, stable, and bank anti-fraud likes it. The cost is that clients hold
 exit addresses, so rotation is visible to them (`fleet subscription` fixes that), and
-every exit holds all client credentials.
+every exit holds all client credentials — and **rotating an exit does not revoke
+them**: the same UUIDs are pushed to each replacement, so use `fleet client revoke`
+when a credential rather than an address needs changing.
 
 **`mode = "cascade"`** — add a Russian anchor when you need one.
 

@@ -285,9 +285,18 @@ def exit_config(inv: Inventory, node: dict, clients: list[dict] | None = None) -
 
     In direct mode there is no entry node, so the exit necessarily holds every client
     credential. That is the real cost of dropping the cascade: each ephemeral foreign
-    box, in a jurisdiction you did not choose, now holds the UUIDs of all your devices.
-    They are only bearer tokens for your own proxy, and they die with the rotation, but
-    it is a genuine downgrade rather than a free simplification.
+    box, in a jurisdiction you did not choose, now holds the UUIDs and shortIds of all
+    your devices. They are only bearer tokens for your own proxy, but it is a genuine
+    downgrade rather than a free simplification.
+
+    **Rotation does NOT revoke them.** An earlier version of this docstring claimed
+    they "die with the rotation"; that is false, and the mistake matters. Client
+    credentials live in state and are re-pushed to every new exit — verified against a
+    live fleet, where one client UUID outlived several exit rotations. So a UUID taken
+    from a seized or hostile exit stays valid on every *future* exit too. The only
+    thing that invalidates it is `fleet client revoke <name>`, which re-keys that
+    client and pushes the change to the pool. Rotate exits to change your addresses;
+    revoke clients to change your credentials. They are separate operations.
     """
     tr = node.get("transport", "xhttp")
     if inv.cascade:
