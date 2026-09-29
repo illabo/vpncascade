@@ -1,0 +1,34 @@
+# ── secrets and live state ────────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+inventory.toml
+*.toml
+!inventory.example.toml
+!pyproject.toml
+state/
+# state backups hold every exit private key and client UUID
+backups/
+*.key
+*.pem
+id_ed25519*
+id_rsa*
+!*.pub.example
+
+# ── personal operational notes (local only, never published) ──────────────
+# HANDOFF.md carries LAN addresses, MACs, device inventory and location.
+# For an anti-censorship project that is a deanonymisation surface, not just
+# a config leak. Keep it local; it still works for local deploys.
+HANDOFF.md
+
+# ── generated client material ─────────────────────────────────────────────
+*.conf
+!*.conf.example
+*-client.json
+subscription.txt
+*.qr
+
+# ── junk ──────────────────────────────────────────────────────────────────
+*.pyc
+__pycache__/
+.DS_Store

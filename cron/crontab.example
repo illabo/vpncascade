@@ -1,0 +1,59 @@
+# fleet — scheduled maintenance.
+#   crontab -e   and paste, adjusting the path.
+#
+# cron runs with a minimal environment, so PATH and the repo location must be explicit.
+# Credentials come from <repo>/.env, which bin/fleet sources itself.
+
+PATH=/usr/local/bin:/usr/bin:/bin
+FLEET_ROOT=/home/you/vpncascade
+
+# Optional: where failures get shouted. Reads the message on stdin.
+#   ntfy:     FLEET_NOTIFY_CMD=curl -s -d @- ntfy.sh/your-private-topic
+#   telegram: FLEET_NOTIFY_CMD=curl -s -X POST -d chat_id=$CHAT -d text="$(cat)" https://api.telegram.org/bot$TOKEN/sendMessage
+#   mail:     FLEET_NOTIFY_CMD=mail -s "fleet alert" you@example.com
+# FLEET_NOTIFY_CMD=curl -s -d @- ntfy.sh/your-private-topic
+
+# ── every 15 min: health, replace anything blocked from Russia, refill the pool ──
+# This is the one that matters. An exit whose whole IP range gets blacklisted from
+# Russia is dead to you immediately, not at its scheduled rotation.
+*/15 * * * *  $FLEET_ROOT/cron/fleet-cron.sh cron
+
+# ── hourly: destroy orphans and top up self-expiring nodes ──────────────────────
+# `cron` already does this, but a separate cheap pass means a stuck rotation does
+# not also stop you reclaiming a server you are paying for.
+17 * * * *    $FLEET_ROOT/cron/fleet-cron.sh reap
+
+# ── daily at 04:22: force a rotation even if nothing has aged out ───────────────
+# A jittered minute, not :00 — a fleet that churns on the hour is itself a pattern.
+22 4 * * *    $FLEET_ROOT/cron/fleet-cron.sh rotate
+
+# ── weekly report ───────────────────────────────────────────────────────────────
+# 30 9 * * 1  $FLEET_ROOT/cron/fleet-cron.sh status
+
+
+# ══ systemd alternative (better: proper logs, RandomizedDelaySec jitter) ════════
+#
+# /etc/systemd/system/fleet.service
+#   [Unit]
+#   Description=fleet maintenance
+#   [Service]
+#   Type=oneshot
+#   User=you
+#   WorkingDirectory=/home/you/vpncascade
+#   ExecStart=/home/you/vpncascade/cron/fleet-cron.sh cron
+#
+# /etc/systemd/system/fleet.timer
+#   [Unit]
+#   Description=fleet maintenance every 15 minutes
+#   [Timer]
+#   OnCalendar=*:0/15
+#   RandomizedDelaySec=180
+#   Persistent=true
+#   [Install]
+#   WantedBy=timers.target
+#
+#   systemctl enable --now fleet.timer
+#
+# RandomizedDelaySec is worth having: it stops every rotation landing on the same
+# wall-clock minute, which is the kind of regularity that makes a fleet easy to
+# correlate across providers.

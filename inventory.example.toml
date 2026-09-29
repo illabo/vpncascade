@@ -1,0 +1,300 @@
+# fleet inventory — copy to inventory.toml and edit.
+# Secrets never live here; they come from the environment (see .env.example).
+
+version = 1
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MODE
+#
+#   "direct"  — clients → rotating foreign exit. No Russian node, so nothing is
+#               tied to your passport and there is nothing for RKN to order a host
+#               to delete. The split happens on the router/client, and Russian
+#               sites see your home ISP address, which for a home connection is a
+#               better source than a datacenter IP anyway. Cost: clients hold exit
+#               addresses, so rotation is visible to them (use `fleet subscription`),
+#               and every exit holds all client credentials.
+#
+#   "cascade" — clients → stable RU entry node → rotating foreign exit. Rotation is
+#               invisible to clients, the split is central and covers phones on
+#               mobile data, and the client's leg never crosses the border — which
+#               matters because RU DPI has been observed freezing *any* foreign TLS
+#               connection past ~16 KB on mobile networks. Cost: the RU node is
+#               identity-bound and can be ordered offline.
+#
+# Start with "direct" on a fixed-line home ISP. Switch to "cascade" if mobile
+# clients stall, or when you want RU-source egress away from home.
+# See docs/05-detectability.md.
+# ─────────────────────────────────────────────────────────────────────────────
+mode = "direct"
+
+[defaults]
+ssh_key       = "~/.ssh/id_ed25519"
+ssh_user      = "root"
+ssh_port      = 2222          # bootstrap moves sshd here and firewalls it
+xray_version  = "latest"      # resolved to a concrete version and pinned per rotation
+drain_seconds = 120           # overlap before an old exit is destroyed
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ENTRY — the stable anchor inside Russia.  [ignored when mode = "direct"]
+#
+# Bought by hand: Russian hosts must identify customers (Gosuslugi/ESIA or
+# passport), so this node cannot be anonymous and must never be API-churned. The
+# `manual` driver refuses to create or destroy it. See docs/01-research-findings.md §4.
+# ─────────────────────────────────────────────────────────────────────────────
+[entry]
+name     = "entry-ru"
+provider = "manual"
+host     = ""                 # ← the IP of your RU VPS
+port     = 443                # REALITY on 443; TLS on an odd port is itself a signal
+
+# The site this node impersonates. A Russian client connecting to a Russian IP with
+# a Russian SNI on 443 is the least interesting flow on the network. The dest must
+# actually be reachable from this node — REALITY proxies unauthenticated handshakes
+# to it, and an unreachable dest turns probe-resistance into a unique fingerprint.
+reality_dest = "corp.ozon.ru:443"
+reality_sni  = ["corp.ozon.ru"]
+
+# tcp   = VLESS + REALITY + XTLS-Vision. Works with EVERY client, and much faster
+#         (Vision splices instead of re-encrypting). Required if anything on your side
+#         is sing-box-based — podkop, most OpenWrt tooling, several mobile apps —
+#         because upstream sing-box does not implement XHTTP and says it will not.
+# xhttp = VLESS + REALITY + XHTTP. Better against flow-shape analysis, CDN-frontable,
+#         xray-core only.
+transport   = "tcp"
+
+# Only read when transport = "xhttp":
+xhttp_path  = "/api/v1/update"
+xhttp_host  = "corp.ozon.ru"
+xhttp_mode  = "stream-one"    # auto | packet-up | stream-up | stream-one
+
+fingerprint = "firefox"       # chrome/safari/ios were hit in summer 2026; re-test periodically
+
+[entry.split]
+enabled = true
+
+# In cascade mode: everything matching leaves the RU node directly, with a Russian
+# datacenter source IP. In direct mode this same list is used by the client/router
+# config, and matching traffic leaves via your own ISP — so these settings are read
+# in BOTH modes, despite living under [entry].
+# Omit this key to use the built-in list (75 domains: banks, gosuslugi, Yandex, VK,
+# Ozon, WB, Avito, telecoms…). Listed here it REPLACES the default, so copy the
+# default from fleet/config.py first if you only mean to add to it.
+# direct_domains = ["domain:sber.ru", "domain:gosuslugi.ru", "geosite:category-ru"]
+
+# Matches connections the client opened to a bare IP rather than a hostname.
+direct_ips = ["geoip:private", "geoip:ru"]
+
+# Resolvers used only for the domains above, so RU-direct traffic lands on the right
+# domestic CDN edge. Foreign domains are never resolved on this node — see the note
+# at the top of fleet/render.py about DNS poisoning and geoip:ru.
+ru_dns = ["77.88.8.8", "77.88.8.1"]
+
+# block_domains = ["geosite:category-ads-all"]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ROUTER — the box on this LAN that terminates the tunnel.
+#
+# This is how a rotated exit reaches the router without a hosted subscription, a DNS
+# record, or any inbound path from the internet: the orchestrator and the router are
+# on the same LAN, so fleet just SSHes across and updates podkop after every change.
+# Nothing for CGNAT or SORM to sit in the middle of, and rotation goes back to being
+# invisible to every device on the network.
+#
+# Give the orchestrator's SSH public key to the router first:
+#   ssh-copy-id -p 22 root@192.168.8.1
+# ─────────────────────────────────────────────────────────────────────────────
+[router]
+enabled = false                 # set true once the key is in place
+host    = "root@192.168.8.1"
+client  = "beryl"               # which fleet client this router uses
+# The orchestrator must stay OUT of the tunnel, or its health probes leave through an
+# exit and measure the tunnel instead of the ISP — a blocked exit then looks healthy.
+# Set this explicitly; auto-detection would pick whichever machine runs fleet.
+orchestrator_ip = "192.168.8.227"
+# ssh_port = 22
+# ssh_key  = "~/.ssh/id_ed25519"
+# strict_host_key = true        # after the first successful connection, turn this on
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# EXITS — ephemeral, rotated, never seen by clients.
+# ─────────────────────────────────────────────────────────────────────────────
+[exits]
+# In direct mode this must be >= 2: with a single exit, rotating it breaks every
+# client at once, because the client-side balancer has nowhere to fail over to.
+pool_size      = 2            # how many serve traffic at once (balancer picks by latency)
+max_age_hours  = 72           # rotate past this age
+min_age_hours  = 6            # refuse to churn faster than this without --force
+port           = 443
+
+# Default masking for exits. Overridden per provider below — a German box should not
+# be presenting a .ru SNI (SNI/IP-geography mismatch is exactly what TSPU looks for,
+# and the dest is probably geo-blocked from abroad anyway).
+reality_dest = "www.wikipedia.org:443"
+reality_sni  = ["www.wikipedia.org"]
+transport    = "tcp"          # see the note under [entry]
+xhttp_path   = "/api/v1/update"
+xhttp_mode   = "stream-one"
+fingerprint  = "firefox"
+# allow_xhttp = true          # silence the sing-box incompatibility warning
+
+# How much paid runway to keep beyond max_age_hours on self-expiring providers
+# (SporeStack). This IS your outage budget: it is exactly how long the fleet keeps
+# working with the orchestrator switched off. 120h = a long weekend with the laptop shut.
+expiry_buffer_hours = 120
+
+
+# SporeStack: anonymous (no account, no email, XMR/BTC), and servers carry an expiry
+# so self-destruct is the default rather than something cron must remember.
+# Needs $SPORESTACK_TOKEN. `fleet providers --catalogue` lists valid slugs.
+# ─── PICK REGIONS NEAR YOU, NOT NEAR EUROPE ──────────────────────────────────
+# Most guides assume you are in western Russia and default to Amsterdam/Frankfurt.
+# CAUTION: measured 2026-09-28, this reasoning did NOT hold — Sweden was 167 ms and
+# Singapore 294 ms from a Far East Rostelecom line, because the route goes west to
+# Moscow either way. Measure before believing the geography. Original note follows:
+# From the Russian Far East that is the wrong side of the planet: traffic usually transits
+# Moscow first, so a "European" exit costs you the width of Russia twice.
+#
+# From the Russian Far East the good exits are, roughly in order of latency:
+#   Vultr   nrt (Tokyo), itm (Osaka), icn (Seoul), sgp (Singapore), hnl, sea, lax, sjc
+#   SporeStack/slowservers  spknwalb (Spokane, WA) — US west coast, a short Pacific hop
+#   DigitalOcean            sgp1, sfo2/sfo3
+# Avoid sporestack_eu (Amsterdam/Stockholm) and Hetzner (Finland/Germany) for latency,
+# quite apart from Hetzner's reachability problems.
+#
+# This does not change the censorship picture at all — REALITY does not care where the
+# server is — it is purely about round-trip time, and it is worth 150-250 ms.
+#
+# Slugs below are live values from `fleet providers --catalogue` (checked 2026-09-26).
+#
+# SporeStack now runs its OWN infrastructure as well as reselling:
+#   sporestack_eu  amsterdam, stockholm     1GB $7.50/mo   — monthly billing only
+#   slowservers    spknwalb (Spokane, WA)   1GB $5.00/mo   — monthly billing only
+#   digitalocean   fra1, ams3, lon1, …      1GB 38c/day    — daily billing
+#   vultr          fra, ams, sto, waw, …    1GB 32c/day    — daily billing
+#
+# The tension to be aware of: only the RESOLD upstreams bill daily, and DigitalOcean
+# and Vultr are exactly the ASNs most heavily blocked from Russia. SporeStack's own
+# ranges are far less likely to be blocked but bill monthly, so they suit a slow
+# rotation (max_age_hours = 336) rather than a 72h churn. Pick one axis or the other.
+# Vultr Tokyo/Seoul/Singapore — the lowest-latency option from the Far East, and
+# its own ASN (AS20473) rather than a resold one.
+[[exits.providers]]
+name         = "vultr"
+weight       = 3
+regions      = ["nrt", "icn", "sgp"]
+server_type  = "vc2-1c-1gb"
+image        = "debian 12"
+reality_dest = "www.wikipedia.org:443"
+reality_sni  = "www.wikipedia.org"
+
+# SporeStack's own US west-coast metal: a short Pacific hop, anonymous, and an ASN
+# nobody has swept. Monthly billing, so pair it with a slow rotation.
+[[exits.providers]]
+name              = "sporestack"
+weight            = 2
+regions           = ["spknwalb"]
+server_type       = "slowservers-1gb"
+image             = "debian-13"
+upstream_provider = "slowservers"
+reality_dest      = "www.wikipedia.org:443"
+reality_sni       = "www.wikipedia.org"
+
+# ── MEASURED WINNER, 2026-09-27 ────────────────────────────────────────────────
+# Hetzner Cloud SINGAPORE. Do not confuse it with "Hetzner": the German estate is
+# AS24940 and is dead from a Russian home line, but Singapore is a *different* ASN,
+# AS215859 (HETZNER-CLOUD4-AS, netname CLOUD-SIN, 5.223.0.0/17), and it PASSES the
+# 14-34 KB DPI freeze measured from a Russian Far East home ISP.
+# Card-payable, hourly-billed, and the `hetzner` driver already exists.
+# The aggregate blocklist marks this range 100% blocked. It is wrong. Measure.
+[[exits.providers]]
+name              = "hetzner"
+weight            = 4
+regions           = ["sin"]
+server_type       = "cpx11"
+image             = "debian-13"
+reality_dest = "www.grab.com:443"
+reality_sni  = "www.grab.com"
+
+# UpCloud — AS202053, on neither RKN list as of 2026-09, Singapore zone (no Moscow
+# transit from the Far East), and payable with an ordinary card. Credential is
+# `username:password` in $UPCLOUD_API_CREDENTIALS, not a token.
+# [[exits.providers]]
+# name              = "upcloud"
+# weight            = 3
+# regions           = ["sg-sin1", "us-sjo1"]
+# server_type       = "1xCPU-1GB"
+# image             = "debian-13"
+# reality_dest      = "www.wikipedia.org:443"
+# reality_sni       = "www.wikipedia.org"
+
+# Daily-billed alternative, if fast rotation matters more than ASN reachability.
+# [[exits.providers]]
+# name              = "sporestack"
+# weight            = 1
+# regions           = ["fra1", "ams3"]
+# server_type       = "vps-1vcpu-1gb"
+# image             = "debian-13"
+# upstream_provider = "digitalocean"
+
+# Hetzner is commented out deliberately: heavily blocked from Russia AND on the far
+# side of the planet from the Far East. Two strikes.
+# [[exits.providers]]
+# name         = "hetzner"
+# regions      = ["hel1", "fsn1", "nbg1"]
+# server_type  = "cx22"
+# image        = "debian-12"
+# reality_dest = "www.wikipedia.org:443"
+
+# [[exits.providers]]
+# name         = "vultr"
+# weight       = 1
+# regions      = ["fra", "ams", "sto"]
+# server_type  = "vc2-1c-1gb"
+# image        = "debian 12"        # resolved to a numeric os_id automatically
+# reality_dest = "www.wikipedia.org:443"
+
+# [[exits.providers]]
+# name         = "digitalocean"
+# weight       = 1
+# regions      = ["fra1", "ams3"]
+# server_type  = "s-1vcpu-1gb"
+# image        = "debian-12-x64"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CLIENTS — one credential per device, so you can revoke a phone without re-keying
+# everything. Managed with `fleet client add|revoke|uri`; this list is only a hint
+# for `fleet init`.
+# ─────────────────────────────────────────────────────────────────────────────
+clients = []
+
+# UpCloud — the ASN-diversity candidate. AS202053 appears on neither the 391-AS
+# full block nor the 47-AS dynamic list, it has a Singapore zone (short Pacific
+# hop, no Moscow transit), and it takes an ordinary card.
+#
+# Needs $UPCLOUD_API_TOKEN (Control Panel → Account → API Tokens; starts `ucat_`).
+# Do NOT enable a provider whose credential is missing: every provisioning attempt
+# then raises, which burns the reroll attempts in provision_exit_with_reroll and
+# can fail an unattended cron run.
+#
+# Slugs verified against the live API 2026-09-29:
+#   zones        sg-sin1, au-syd1
+#   server_type  DEV-1xCPU-1GB-10GB = EUR 3.75/mo in sg-sin1, 10 GB disk, 1 TB
+#                transfer — same price as STARTER-1xCPU-1GB but twice the
+#                transfer. `fleet providers --catalogue` lists slugs.
+#   image        debian-13
+# Re-ENABLED 2026-09-29: account left trial (EUR 10 deposit), so the platform
+# firewall is controllable again and the driver's `"firewall": "off"` is
+# accepted at creation. See the UpCloud section in HANDOFF.md.
+[[exits.providers]]
+name         = "upcloud"
+weight       = 5
+regions      = ["sg-sin1"]
+server_type  = "DEV-1xCPU-1GB-10GB"
+image        = "debian-13"
+reality_dest = "www.grab.com:443"
+reality_sni  = ["www.grab.com", "www.straitstimes.com", "www.shopee.sg",
+                "www.samsung.com", "www.lovelive-anime.jp"]
