@@ -90,6 +90,30 @@ for s in 127.0.0.43 "$GW" 1.1.1.1; do
   nslookup github.com "$s" >/dev/null 2>&1 && echo "OK" || echo "NO ANSWER"
 done
 
+# Local-only zones must never reach a public resolver, and must never bounce
+# between the two local ones. Both failures are silent and both are easy to
+# reintroduce: dnsproxy routes these zones to dnsmasq, and dnsmasq only answers
+# them if it is authoritative. Configure one without the other and you get
+# either a leak (fast, wrong) or a loop (5s per query).
+#
+# Timing tells them apart, so no packet capture is needed:
+#   ~0ms    answered locally            -- correct
+#   ~200ms  same cost as a public name  -- LEAKING to a public resolver
+#   ~5000ms the dnsproxy timeout        -- LOOPING with dnsmasq
+echo "  local-only zones (must be answered locally, not forwarded):"
+for z in lan local internal home.arpa; do
+  st=$(date +%s); n=0
+  while [ $n -lt 4 ]; do
+    nslookup "probe$$$n.$z" 127.0.0.43 >/dev/null 2>&1; n=$((n+1))
+  done
+  ms=$(( ($(date +%s) - st) * 1000 / 4 ))     # BusyBox date has no %N; batch it
+  if   [ "$ms" -ge 2000 ]; then r="!! LOOP with dnsmasq (${ms}ms) — dnsmasq is not authoritative for /$z/"
+  elif [ "$ms" -ge 60 ];   then r="!! LEAKING upstream (${ms}ms) — internal names are going to a public resolver"
+  else                          r="ok, local (${ms}ms)"
+  fi
+  printf '    %-12s %s\n' "$z" "$r"
+done
+
 # --------------------------------------------------------- 6. stale sockets
 echo
 echo "--- 6. SOCKETS BOUND TO A DEAD UPLINK ---"

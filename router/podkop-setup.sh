@@ -13,6 +13,7 @@
 # Environment:
 #   DNS_UPSTREAMS  space-separated dnsproxy upstreams (default: IP-pinned DoT below)
 #   DNS_BIND       loopback address for the local resolver (default 127.0.0.43)
+#   LOCAL_DNS      resolver for local-only zones (default 127.0.0.1:53 = dnsmasq)
 #   SKIP_DNS=1     leave DNS alone
 set -eu
 
@@ -21,6 +22,9 @@ warn() { echo "[podkop-setup] WARNING: $*"; }
 die()  { echo "[podkop-setup] FATAL: $*" >&2; exit 1; }
 
 DNS_BIND="${DNS_BIND:-127.0.0.43}"
+# Where local-only zones are resolved. dnsmasq holds 127.0.0.1:53 and is
+# authoritative for them, so nothing here can be forwarded off the router.
+LOCAL_DNS="${LOCAL_DNS:-127.0.0.1:53}"
 SKIP_DNS="${SKIP_DNS:-0}"
 
 # Every upstream is an IP LITERAL whose certificate carries a matching IP SAN, so
@@ -82,6 +86,23 @@ else
     # load_balance (NOT parallel): parallel queries every upstream on every lookup,
     # so all of them see your full history. load_balance picks one per query, which
     # fragments history across operators instead of handing it to each of them.
+    # dnsmasq must be AUTHORITATIVE for every zone we are about to hand it, or
+    # the two resolvers feed each other: dnsproxy -> dnsmasq -> (its upstream is
+    # sing-box -> dnsproxy) -> round and round until the 5s timeout. That is not
+    # hypothetical -- it happened here the first time, and only *.internal and
+    # *.home.arpa were affected, because dnsmasq already treats /lan/ as local
+    # and implements RFC 6762 for /local/ on its own. `server=/zone/` with no
+    # address after it means "answer from local data, never forward".
+    #
+    # So this must run BEFORE the dnsproxy config below, and both must be
+    # present. If you ever remove one, remove the other.
+    for z in internal home.arpa; do
+      uci -q get dhcp.@dnsmasq[0].server 2>/dev/null | grep -q "/$z/" || \
+        uci add_list dhcp.@dnsmasq[0].server="/$z/" 2>/dev/null || true
+    done
+    uci commit dhcp 2>/dev/null || true
+    /etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
+
     mkdir -p /etc/dnsproxy
     [ -f /etc/dnsproxy/dnsproxy.yaml ] && \
       cp /etc/dnsproxy/dnsproxy.yaml /etc/dnsproxy/dnsproxy.yaml.bak-fleet 2>/dev/null || true
@@ -89,8 +110,31 @@ else
       echo "# Written by router/podkop-setup.sh. GL firmware updates may reset this;"
       echo "# re-running the script restores it (it is idempotent)."
       echo "upstream:"
+      # Local-only zones are answered by dnsmasq and NEVER forwarded. Measured
+      # before this was added: a lookup of *.lan through dnsproxy took 233ms,
+      # a public name took 200ms -- indistinguishable, because it WAS a public
+      # lookup. Every internal name anyone resolved through the tunnel
+      # (orchestrator.lan, a printer, a NAS) was handed to a public resolver,
+      # which is a free inventory of the house for whoever runs it. Afterwards
+      # the same lookup is 0ms.
+      #
+      # dnsmasq is authoritative for all four, so it answers rather than
+      # forwarding back here -- there is no loop to create.
+      #   lan        this LAN'"'"'s own domain (dnsmasq `local=/lan/`)
+      #   local      mDNS; RFC 6762 forbids it reaching unicast DNS at all
+      #   internal   RFC 8375 / widespread private use
+      #   home.arpa  RFC 8375, the designated home-network zone
+      for z in lan local internal home.arpa; do
+        echo "  - \"[/${z}/]${LOCAL_DNS}\""
+      done
       for u in $DNS_UPSTREAMS; do echo "  - ${u}"; done
       echo "upstream-mode: load_balance"
+      # A reverse lookup is the same leak wearing a hat: asking a public
+      # resolver "who is 192.168.8.227" says this network exists and something
+      # is enumerating it. Send those to dnsmasq too.
+      echo "use-private-rdns: true"
+      echo "private-rdns-upstream:"
+      echo "  - ${LOCAL_DNS}"
       echo "listen-addrs:"
       echo "  - \"${DNS_BIND}\""
       echo "listen-ports:"
