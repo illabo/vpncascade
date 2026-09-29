@@ -36,7 +36,7 @@ import threading
 import time
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
@@ -101,6 +101,15 @@ _name_map: dict[str, str] = {}
 #: Previous (t, up_total, down_total) from the live endpoint, so it can report a
 #: real rate. Clash only exposes cumulative counters; a rate needs two samples.
 _live_prev: dict[str, float] = {}
+
+#: When each outbound was last nudged into measuring itself, so an open page does
+#: not re-probe the same gap every five seconds.
+_probe_at: dict[str, float] = {}
+PROBE_EVERY = 60.0
+#: Cloudflare rather than the gstatic default podkop bakes in: measured from this
+#: router at 0.91s against gstatic's 1.79s, and it is not a Google endpoint, which
+#: matters on a line where Google is partially degraded.
+PROBE_URL = "http://cp.cloudflare.com/generate_204"
 
 #: Live-refresh script for the stats page. Kept OUT of the page f-string on
 #: purpose: JavaScript is full of `{` and `}`, which an f-string reads as
@@ -585,6 +594,48 @@ class Handler(BaseHTTPRequestHandler):
             f"<td class=sub>{rstats.human_bytes(r['bytes'])}</td></tr>"
             for r in rows) + "</table>"
 
+    @staticmethod
+    def _fill_probe_gaps(exits: list) -> None:
+        """Ask sing-box to measure any outbound it has never measured.
+
+        urltest stops probing once it finds a member that is good enough, so a
+        healthy exit can sit permanently at "no probe yet" — and, worse, urltest
+        keeps selecting a slower exit because it never looked at the faster one.
+        Observed on this fleet: the unprobed exit measured 452 ms against the
+        selected one's 631 ms.
+
+        Filling the gap also feeds urltest the data it needs to reconsider. Costs
+        one request per unmeasured outbound, at most once a minute each, and ONLY
+        while somebody has the stats page open, since the page is what calls it.
+        Fired in the background so the response stays fast; the next poll shows
+        the value.
+        """
+        import threading
+
+        now = time.time()
+        todo = []
+        with _lock:
+            for e in exits:
+                if e.get("delay_ms") is not None:
+                    continue
+                tag = e.get("name", "")
+                if not tag or now - _probe_at.get(tag, 0) < PROBE_EVERY:
+                    continue
+                _probe_at[tag] = now
+                todo.append(tag)
+
+        def _probe(tag: str) -> None:
+            try:
+                rstats._get_json(
+                    f"{CLASH_BASE}/proxies/{quote(tag)}/delay"
+                    f"?timeout=8000&url={quote(PROBE_URL, safe='')}"
+                )
+            except Exception:                        # noqa: BLE001 - best effort
+                pass
+
+        for tag in todo:
+            threading.Thread(target=_probe, args=(tag,), daemon=True).start()
+
     def _stats_json(self) -> bytes:
         """Live numbers for the page to poll. Deliberately CHEAP.
 
@@ -620,6 +671,8 @@ class Handler(BaseHTTPRequestHandler):
                 up_bps, dn_bps = du * 8 / dt, dd * 8 / dt
 
         sel = cur.get("selected", "")
+        if CLASH_BASE:
+            self._fill_probe_gaps(cur.get("exits", []))
         # The age of the last STORED sample (the 3-minute SSH-backed one), plus the
         # server's own clock. The page ticks the counter locally between polls but
         # re-baselines from these, so it can never drift or depend on the browser's
