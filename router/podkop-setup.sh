@@ -102,11 +102,42 @@ else
       # nothing to resolve and nothing to poison.
     } > /etc/dnsproxy/dnsproxy.yaml
 
-    if [ -f /etc/init.d/dnsproxy ]; then
-      /etc/init.d/dnsproxy enable >/dev/null 2>&1 || true
-      /etc/init.d/dnsproxy restart >/dev/null 2>&1 || true
-      sleep 3
-    fi
+    # Do NOT use GL.iNet's /etc/init.d/dnsproxy. Two reasons, both silent:
+    #   * its start_service() returns 0 without doing anything unless
+    #     `gl-dns-v2.@dns[0].mode` is "secure", so the resolver never comes up and
+    #     nothing logs why — this is what made dnsproxy look like it "won't stay up
+    #     under procd" for weeks;
+    #   * it hardcodes `--upstream-mode=parallel`, which overrides the config file
+    #     and queries EVERY upstream on EVERY lookup, handing each operator the
+    #     complete query history — the opposite of what load_balance is for.
+    # Ship our own instance instead, independent of the vendor's DNS layer.
+    say "installing the fleet-dnsproxy service (GL's launcher is gated and hardcodes parallel)"
+    cat > /etc/init.d/fleet-dnsproxy <<'INIT'
+#!/bin/sh /etc/rc.common
+# dnsproxy for fleet, independent of GL.iNet's gl-dns-v2 gating.
+# Binds 127.0.0.43:53 — dnsmasq holds 127.0.0.1 and the LAN address, sing-box
+# holds 127.0.0.42, so this address is free.
+START=89
+STOP=11
+USE_PROCD=1
+PROG=/usr/sbin/dnsproxy
+CONFIG_FILE=/etc/dnsproxy/dnsproxy.yaml
+
+start_service() {
+    [ -f "$CONFIG_FILE" ] || return 1
+    procd_open_instance
+    procd_set_param command "$PROG" --config-path="$CONFIG_FILE"
+    procd_set_param file "$CONFIG_FILE"
+    procd_set_param stdout 1
+    procd_set_param stderr 1
+    procd_set_param respawn
+    procd_close_instance
+}
+INIT
+    chmod +x /etc/init.d/fleet-dnsproxy
+    /etc/init.d/fleet-dnsproxy enable  >/dev/null 2>&1 || true
+    /etc/init.d/fleet-dnsproxy restart >/dev/null 2>&1 || true
+    sleep 4
 
     if nslookup openwrt.org "$DNS_BIND" >/dev/null 2>&1; then
       say "local resolver answering on ${DNS_BIND}:53"
