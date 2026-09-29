@@ -177,4 +177,59 @@ if ! printf '%s' "$OUT" | grep -qE '^(OK|NO)\|'; then
   info "$(printf '%s' "$OUT" | tail -15)"
 fi
 
+# ---------------------------------------------------------------- served JS
+# The stats page embeds a script inside a PYTHON string. A previous version used
+# \" for HTML attribute quotes; Python collapsed those to bare quotes and shipped
+# a page whose JavaScript died on parse -- silently, because a broken <script>
+# produces no server error and no failing request. Nothing caught it but a human
+# reading the page source.
+#
+# So: extract the script as served and hand it to a real engine. Wrapping the
+# source in Function() compiles it WITHOUT running it, which is what we want --
+# this must never execute panel code.
+head1 "t13b — the stats page's embedded JavaScript parses"
+
+JSC=/System/Library/Frameworks/JavaScriptCore.framework/Versions/A/Helpers/jsc
+if [ ! -x "$JSC" ] && command -v node >/dev/null 2>&1; then JSC=node; fi
+
+if [ ! -x "$JSC" ] && [ "$JSC" != node ]; then
+  skip "no JavaScript engine available (jsc or node) to syntax-check the page"
+else
+  python3 - "$TMP" <<'PY'
+import importlib.util, io, os, re, sys
+sys.path.insert(0, ".")
+spec = importlib.util.spec_from_file_location("fw", "orchestrator/fleet-web.py")
+fw = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(fw)
+# LIVE_JS is what the page embeds verbatim; no server needed to inspect it.
+m = re.search(r"<script>(.*?)</script>", fw.LIVE_JS, re.S)
+io.open(os.path.join(sys.argv[1], "live.js"), "w").write(m.group(1) if m else "")
+PY
+  if [ "$JSC" = node ]; then
+    if node --check "$TMP/live.js" 2>/dev/null; then
+      pass "embedded JavaScript parses (node)"
+    else
+      fail "embedded JavaScript is a SYNTAX ERROR"
+      node --check "$TMP/live.js" 2>&1 | head -3 | sed 's/^/      /'
+    fi
+  else
+    cat > "$TMP/chk.js" <<'JS'
+try { new Function(readFile("LIVEJS")); print("OK"); }
+catch (e) { print("ERR " + e); }
+JS
+    sed -i '' "s|LIVEJS|$TMP/live.js|" "$TMP/chk.js" 2>/dev/null ||       sed -i "s|LIVEJS|$TMP/live.js|" "$TMP/chk.js"
+    out="$("$JSC" "$TMP/chk.js" 2>&1)"
+    case "$out" in
+      OK*) pass "embedded JavaScript parses (JavaScriptCore)" ;;
+      *)   fail "embedded JavaScript is a SYNTAX ERROR"; echo "      $out" ;;
+    esac
+  fi
+  # The specific regression: Python eating the backslash before an attribute quote.
+  if grep -q 'title=""' "$TMP/live.js" 2>/dev/null; then
+    fail "attribute quotes were collapsed -- escaping regression is back"
+  else
+    pass "no collapsed attribute quotes in the served script"
+  fi
+fi
+
 summary

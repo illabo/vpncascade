@@ -105,27 +105,26 @@ _live_prev: dict[str, float] = {}
 #: Live-refresh script for the stats page. Kept OUT of the page f-string on
 #: purpose: JavaScript is full of `{` and `}`, which an f-string reads as
 #: placeholders, and escaping every one of them is a mistake waiting to happen.
-LIVE_JS = """<script>
+LIVE_JS = r"""<script>
 // Live refresh for the numbers that come from sing-box's local HTTP API. The
-// slow, SSH-backed parts of this page (podkop, DNS, the sparkline history) stay
-// as rendered.
+// slow, SSH-backed parts of this page (podkop, DNS, the sparklines) stay as
+// rendered.
 //
-// POLLS ONLY WHEN SOMEONE IS ACTUALLY LOOKING. Every tick is a request to the
-// router, so a tab left open overnight would be thousands of pointless queries
-// against a small box. Two guards:
-//   * document.visibilityState - a hidden or minimised tab polls not at all,
-//     and resumes with an immediate tick so it is never stale on return.
-//   * an idle timer - a tab that is visible but untouched for IDLE_MS stops too,
-//     and any interaction (or coming back to the tab) starts it again.
-// Failures are silent: the last good values stay on screen, because a panel that
-// blanks on one dropped request is worse than one showing a slightly old number.
+// POLLS ONLY WHEN SOMEONE IS LOOKING. Every tick is a request to the router, so
+// a tab left open overnight would be thousands of pointless queries against a
+// small box. Guarded by document.visibilityState and a 10-minute idle timer.
+//
+// NOTE FOR EDITORS: single-quoted JS strings throughout, and no backslash
+// escapes. This block is embedded in a Python string, and an earlier version
+// used \" for the HTML attribute quotes -- Python collapsed them to bare quotes
+// and shipped a page whose script died on parse, silently. Keep it escape-free.
 (function () {
   var EVERY = 5000, IDLE_MS = 10 * 60 * 1000;
-  var last = Date.now(), timer = null;
+  var last = Date.now();
   var el = function (i) { return document.getElementById(i); };
 
   function bps(v) {
-    if (v === null || v === undefined) return "\u2014";
+    if (v === null || v === undefined) return "—";
     var u = ["bit/s", "kbit/s", "Mbit/s", "Gbit/s"], i = 0;
     while (Math.abs(v) >= 1000 && i < u.length - 1) { v /= 1000; i++; }
     return (i ? v.toFixed(1) : Math.round(v)) + " " + u[i];
@@ -143,32 +142,50 @@ LIVE_JS = """<script>
           lat = e.serving ? "carrying traffic" : "no probe yet";
         } else if (e.delay_ms === 0) { lat = "unreachable"; cls = " class=bad"; }
         else { lat = e.delay_ms + " ms"; }
-        h += "<tr><td title=\"" + e.tag + "\">" + e.label + "</td><td" + cls + ">"
-           + lat + "</td><td class=sub>" + (e.serving ? "\u2190 serving" : "") + "</td></tr>";
+        h += '<tr><td title="' + e.tag + '">' + e.label + '</td><td' + cls
+           + '>' + lat + '</td><td class=sub>' + (e.serving ? '← serving' : '')
+           + '</td></tr>';
       });
       t.innerHTML = h;
     }
     if (el("lv-conns")) el("lv-conns").textContent = (d.direct_conns + d.tunnel_conns);
     if (el("lv-down")) el("lv-down").textContent = bps(d.down_bps);
     if (el("lv-up")) el("lv-up").textContent = bps(d.up_bps);
-    if (el("lv-age")) el("lv-age").textContent = " \u00b7 live";
+    if (el("lv-age")) el("lv-age").textContent = " · live";
+    if (d.sample_t) { ageBase = Math.max(0, d.t - d.sample_t); ageAt = Date.now(); }
+    if (d.poll_seconds) pollSecs = d.poll_seconds;
+    ageTick();
   }
+  // Age of the last stored sample. Re-baselined from the server on every poll,
+  // then counted up locally each second so the figure is never frozen at whatever
+  // it happened to be when the page rendered.
+  var ageBase = null, ageAt = 0;
+  function ageTick() {
+    var n = el("lv-sampled");
+    if (!n || ageBase === null) return;
+    var a = Math.max(0, Math.round(ageBase + (Date.now() - ageAt) / 1000));
+    var nxt = pollSecs ? Math.max(0, pollSecs - a) : null;
+    n.textContent = "sampled " + a + "s ago"
+                  + (nxt === null ? "" : " · next in " + nxt + "s");
+  }
+  var pollSecs = 0;
+
   function tick() {
-    if (!watching()) { if (el("lv-age")) el("lv-age").textContent = " \u00b7 paused"; return; }
+    if (!watching()) { if (el("lv-age")) el("lv-age").textContent = " · paused"; return; }
     fetch("/stats.json", { credentials: "same-origin" })
       .then(function (r) { return r.ok ? r.json() : null; })
       .then(function (d) { if (d) draw(d); })
-      .catch(function () { /* keep the last good values */ });
-  }
-  function wake() {
-    last = Date.now();
-    if (document.visibilityState === "visible") tick();
+      .catch(function () { /* keep the last good values on screen */ });
   }
   ["mousemove", "keydown", "touchstart", "scroll", "click"].forEach(function (ev) {
     window.addEventListener(ev, function () { last = Date.now(); }, { passive: true });
   });
-  document.addEventListener("visibilitychange", wake);
-  timer = setInterval(tick, EVERY);
+  document.addEventListener("visibilitychange", function () {
+    last = Date.now();
+    if (document.visibilityState === "visible") tick();
+  });
+  setInterval(tick, EVERY);
+  setInterval(function () { if (watching()) ageTick(); }, 1000);
   tick();
 })();
 </script>"""
@@ -603,8 +620,20 @@ class Handler(BaseHTTPRequestHandler):
                 up_bps, dn_bps = du * 8 / dt, dd * 8 / dt
 
         sel = cur.get("selected", "")
+        # The age of the last STORED sample (the 3-minute SSH-backed one), plus the
+        # server's own clock. The page ticks the counter locally between polls but
+        # re-baselines from these, so it can never drift or depend on the browser's
+        # clock being right.
+        try:
+            rows = rstats.load()
+            sample_t = rows[-1]["t"] if rows else None
+        except Exception:                            # noqa: BLE001
+            sample_t = None
+
         out = {
             "t": int(now),
+            "sample_t": sample_t,
+            "poll_seconds": POLL_SECONDS,
             "reachable": cur.get("reachable", False),
             "selected": sel,
             "selected_label": names.get(sel, sel),
@@ -728,7 +757,7 @@ avoid.</div>
         # --- render ------------------------------------------------------------
         body = f"""
 <h1>router stats</h1>
-<div class=sub>{dot} sampled {age}s ago &middot; {len(rows)} samples over
+<div class=sub>{dot} <span id=lv-sampled>sampled {age}s ago</span> &middot; {len(rows)} samples over
 {span_h:.1f} h &middot; every {POLL_SECONDS//60} min</div>
 
 <h2>tunnel</h2>
