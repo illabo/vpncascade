@@ -667,9 +667,21 @@ def cmd_router_push(args) -> int:
         if state.serving_exits():
             warn(f"this orchestrator has {len(state.serving_exits())} serving exit(s) "
                  f"of its own — a rotation or `fleet cron` will overwrite this import")
-        if args.dry_run:
-            log("dry run — router not touched")
-            return 0
+    # This check used to live inside the --from-file branch above, so a plain
+    # `router push --dry-run` skipped it entirely and did a REAL push. A flag
+    # named --dry-run must never touch the router, whichever path reached it;
+    # this is the most destructive command in the tool and it runs against a
+    # household's only uplink.
+    if args.dry_run:
+        if uris is None:
+            uris = routermod.resolve_uris(inv, state)
+            for u in uris:
+                d = render.describe_uri(u)
+                log(f"  {d['host']}:{d['port']}  sni={d['sni']}  "
+                    f"flow={d['flow']}  id={d['id']}  {d['label']}")
+        log(f"dry run — would push {len(uris)} exit(s) and "
+            f"{len(routermod.ru_direct_domains(inv))} direct domains; router not touched")
+        return 0
 
     changed = routermod.push(inv, state, force=args.force, uris=uris)
     if not changed:
@@ -852,7 +864,7 @@ def build_parser() -> argparse.ArgumentParser:
                      help="push exits from a subscription file instead of state "
                           "(base64 or plain vless:// list; '-' for stdin)")
     rtp.add_argument("--dry-run", action="store_true",
-                     help="with --from-file, list what would be pushed and stop")
+                     help="show what would be pushed and stop, touching nothing")
     rtp.set_defaults(fn=cmd_router_push)
     rtsub.add_parser("status", help="what the router currently has").set_defaults(
         fn=cmd_router_status)

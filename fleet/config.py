@@ -45,6 +45,27 @@ DEFAULT_DIRECT_DOMAINS = [
     "domain:mts.ru", "domain:beeline.ru", "domain:megafon.ru", "domain:tele2.ru",
     # Infrastructure / CDN that only serves RU
     "domain:selectel.ru", "domain:vk.cloud", "domain:cdnvideo.ru", "domain:ngenix.net",
+    # Regional sites. These are the easiest to miss, because a list like this
+    # gets written from whatever the author happens to use; anything popular in
+    # one part of the country and nowhere else falls straight through. Missing
+    # entries are not harmless -- the site still works, it just takes the long
+    # way through a foreign exit and arrives from the wrong country.
+    "domain:farpost.ru", "domain:vl.ru", "domain:dvhab.ru", "domain:primorsky.ru",
+    "domain:dvfu.ru",
+    # Commerce, round two
+    "domain:sportmaster.ru", "domain:lamoda.ru", "domain:eldorado.ru",
+    "domain:petrovich.ru", "domain:vseinstrumenti.ru", "domain:megamarket.ru",
+    "domain:samokat.ru", "domain:vkusvill.ru", "domain:perekrestok.ru",
+    "domain:lenta.com", "domain:auto.ru", "domain:cian.ru", "domain:domclick.ru",
+    # Money, but the comparison sites rather than the banks themselves
+    "domain:sravni.ru", "domain:banki.ru",
+    # Streaming and weather -- heavy, chatty, and pointless to tunnel
+    "domain:ivi.ru", "domain:okko.tv", "domain:premier.one", "domain:wink.ru",
+    "domain:gismeteo.ru", "domain:dzen.ru", "domain:rambler.ru",
+    # Travel
+    "domain:aeroflot.ru", "domain:s7.ru", "domain:pobeda.aero", "domain:utair.ru",
+    # Telecom and endpoint software
+    "domain:rostelecom.ru", "domain:mgts.ru", "domain:kaspersky.ru",
 ]
 DEFAULT_DIRECT_IPS = ["geoip:private", "geoip:ru"]
 # Yandex + Rostelecom resolvers: answers that place you on the right RU CDN edge.

@@ -30,7 +30,12 @@ BASE=""
 for cand in debian:12-slim debian:13-slim ubuntu:24.04 rust:latest; do
   docker image inspect "$cand" >/dev/null 2>&1 && { BASE="$cand"; break; }
 done
-[ -n "$BASE" ] || { fail "no local base image"; exit 1; }
+# A missing image is a missing prerequisite, not a defect in what we are
+# testing. Reporting it as a failure trains you to ignore a red line, which is
+# how the Python-version problem in t13 stayed hidden.
+[ -n "$BASE" ] || {
+  skip "no local base image (pull one: docker pull debian:13-slim)"
+  summary; exit 0; }
 
 ssh-keygen -q -t ed25519 -N '' -f "$WORK/key" -C fleet-t12
 PUB="$(cat "$WORK/key.pub")"

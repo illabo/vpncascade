@@ -89,6 +89,21 @@ def ru_direct_domains(inv: Inventory) -> list[str]:
     return sorted(set(out))
 
 
+def resolve_uris(inv: Inventory, state: State,
+                 uris: list[str] | None = None) -> list[str]:
+    """The exit URIs the router should get. Shared by `push` and its dry run so
+    a preview can never describe a different list than the one that lands."""
+    if uris is not None:
+        return uris
+    client = state.get_client(inv.router.client)
+    if not client:
+        raise FleetError(
+            f"[router].client is `{inv.router.client}` but there is no such client.\n"
+            f"  Run: fleet client add {inv.router.client}"
+        )
+    return client_uris(inv, state, client)
+
+
 def push(inv: Inventory, state: State, *, force: bool = False,
          uris: list[str] | None = None) -> bool:
     """Send an exit list to the router. Returns True if anything changed.
@@ -114,14 +129,7 @@ def push(inv: Inventory, state: State, *, force: bool = False,
     if not r.enabled or not r.host:
         return False
 
-    if uris is None:
-        client = state.get_client(r.client)
-        if not client:
-            raise FleetError(
-                f"[router].client is `{r.client}` but there is no such client.\n"
-                f"  Run: fleet client add {r.client}"
-            )
-        uris = client_uris(inv, state, client)
+    uris = resolve_uris(inv, state, uris)
     if not uris:
         warn("no serving exits — not touching the router "
              "(it keeps its current config and podkop's fail-open keeps RU working)")
@@ -135,7 +143,10 @@ def push(inv: Inventory, state: State, *, force: bool = False,
 
     subnet = lan_subnet(inv)
     domains = ru_direct_domains(inv)
-    fp = fingerprint(uris + [subnet, str(len(domains))])
+    # Hash the domains themselves, not how many there are. With a count, swapping
+    # one domain for another leaves the fingerprint unchanged and `push` reports
+    # "router already has these exits" while the router keeps the old list.
+    fp = fingerprint(uris + [subnet] + domains)
     if not force and state.data.get("router_fingerprint") == fp:
         log(f"router already has these {len(uris)} exit(s)")
         return False
