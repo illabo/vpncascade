@@ -163,5 +163,85 @@ INIT
   fi
 fi
 
+# ------------------------------------------------- uplink-change hotplug hook
+# sing-box samples the routing table once and caches the result. If it looks
+# during the gap between one uplink going away and the next coming up — about
+# three seconds on this hardware — it records "missing default interface" and
+# never re-checks. Every outbound dial then fails with "no route to internet"
+# while the router itself reaches the world perfectly. Measured 2026-09-29:
+#
+#   23:16:36  sing-box  ERROR network: missing default interface
+#   23:16:39  netifd    udhcpc broadcasting discover      <- three seconds later
+#   23:16:40  netifd    lease obtained
+#   ...broken until sing-box was restarted, on an uplink that was entirely healthy
+#
+# This is why roaming between two working uplinks produced hours of "the network
+# is blocking us". It is neither uplink; it is the transition.
+say "installing the uplink-change hotplug hook"
+mkdir -p /etc/hotplug.d/iface
+cat > /etc/hotplug.d/iface/99-fleet-uplink <<'HOOK'
+#!/bin/sh
+# Restart the tunnel stack when the uplink ADDRESS changes. dnsproxy needs it too:
+# its DoT sockets are bound to the old source address and go to "no such device".
+# Guarded on the address actually changing, so DHCP renewals do not restart the
+# tunnel on every lease refresh.
+[ "$ACTION" = "ifup" ] || exit 0
+case "$INTERFACE" in wan|wwan|wan6|wwan6) ;; *) exit 0 ;; esac
+
+NEW=$(ip -4 addr show dev "$DEVICE" 2>/dev/null | awk '/inet /{split($2,a,"/"); print a[1]; exit}')
+[ -n "$NEW" ] || exit 0
+STATE=/tmp/fleet-uplink-addr
+OLD=$(cat "$STATE" 2>/dev/null)
+[ "$NEW" = "$OLD" ] && exit 0
+echo "$NEW" > "$STATE"
+
+logger -t fleet-uplink "uplink ${OLD:-none} -> $NEW; reviving tunnel stack"
+
+revive() {
+  # ORDER MATTERS, and a fixed sleep is a guess. Wait for the thing we actually
+  # depend on — a default route — then restart in dependency order:
+  #   1. default route present      (nothing below works without it)
+  #   2. fleet-dnsproxy             (its DoT sockets are bound to the old source
+  #                                  address; sing-box's DNS depends on it)
+  #   3. sing-box                   (re-reads the default interface at startup;
+  #                                  this is the whole point)
+  # Then VERIFY, because a restart that silently failed is worse than no restart.
+  i=0
+  while [ $i -lt 30 ]; do
+    ip r 2>/dev/null | grep -q '^default' && break
+    i=$((i+1)); sleep 1
+  done
+  ip r 2>/dev/null | grep -q '^default' || {
+    logger -t fleet-uplink "no default route after 30s; giving up"; return 1; }
+  logger -t fleet-uplink "default route up after ${i}s"
+
+  /etc/init.d/fleet-dnsproxy restart
+  /etc/init.d/sing-box restart
+
+  # Verify, and retry once. sing-box occasionally comes up before the firewall
+  # reload has finished reinstalling the TPROXY rules.
+  n=0
+  while [ $n -lt 2 ]; do
+    sleep 6
+    if nslookup openwrt.org 127.0.0.43 >/dev/null 2>&1 \
+       && [ "$(nft list ruleset 2>/dev/null | grep -c podkop)" -gt 0 ]; then
+      logger -t fleet-uplink "revived on $NEW (resolver ok, nft rules present)"
+      return 0
+    fi
+    n=$((n+1))
+    logger -t fleet-uplink "post-restart check failed, retry $n"
+    /etc/init.d/fleet-dnsproxy restart
+    /etc/init.d/sing-box restart
+  done
+  logger -t fleet-uplink "STILL UNHEALTHY on $NEW after 2 attempts — look at logread"
+  return 1
+}
+revive &
+HOOK
+chmod +x /etc/hotplug.d/iface/99-fleet-uplink
+# Seed the state file so the hook does not fire on the next renewal.
+ip -4 addr show dev "$(uci -q get network.wwan.device || echo sta0)" 2>/dev/null \
+  | awk '/inet /{split($2,a,"/"); print a[1]; exit}' > /tmp/fleet-uplink-addr 2>/dev/null || true
+
 say "done — now run 'fleet sync' from the orchestrator to push the exits"
 say "podkop will not route anything until it has them"
