@@ -93,9 +93,98 @@ IMPORT_TTL = 600
 MAX_UPLOAD = 256 * 1024
 _pending_imports: dict[str, dict] = {}
 
+#: Last known outbound->exit-name map, learned by the 3-minute SSH probe. The live
+#: endpoint reuses it rather than opening an SSH connection of its own: the mapping
+#: only changes when exits do, and an SSH handshake every few seconds to a small
+#: router is exactly the kind of self-inflicted load this project has measured before.
+_name_map: dict[str, str] = {}
+#: Previous (t, up_total, down_total) from the live endpoint, so it can report a
+#: real rate. Clash only exposes cumulative counters; a rate needs two samples.
+_live_prev: dict[str, float] = {}
+
+#: Live-refresh script for the stats page. Kept OUT of the page f-string on
+#: purpose: JavaScript is full of `{` and `}`, which an f-string reads as
+#: placeholders, and escaping every one of them is a mistake waiting to happen.
+LIVE_JS = """<script>
+// Live refresh for the numbers that come from sing-box's local HTTP API. The
+// slow, SSH-backed parts of this page (podkop, DNS, the sparkline history) stay
+// as rendered.
+//
+// POLLS ONLY WHEN SOMEONE IS ACTUALLY LOOKING. Every tick is a request to the
+// router, so a tab left open overnight would be thousands of pointless queries
+// against a small box. Two guards:
+//   * document.visibilityState - a hidden or minimised tab polls not at all,
+//     and resumes with an immediate tick so it is never stale on return.
+//   * an idle timer - a tab that is visible but untouched for IDLE_MS stops too,
+//     and any interaction (or coming back to the tab) starts it again.
+// Failures are silent: the last good values stay on screen, because a panel that
+// blanks on one dropped request is worse than one showing a slightly old number.
+(function () {
+  var EVERY = 5000, IDLE_MS = 10 * 60 * 1000;
+  var last = Date.now(), timer = null;
+  var el = function (i) { return document.getElementById(i); };
+
+  function bps(v) {
+    if (v === null || v === undefined) return "\u2014";
+    var u = ["bit/s", "kbit/s", "Mbit/s", "Gbit/s"], i = 0;
+    while (Math.abs(v) >= 1000 && i < u.length - 1) { v /= 1000; i++; }
+    return (i ? v.toFixed(1) : Math.round(v)) + " " + u[i];
+  }
+  function watching() {
+    return document.visibilityState === "visible" && (Date.now() - last) < IDLE_MS;
+  }
+  function draw(d) {
+    var t = el("extable");
+    if (t && d.exits && d.exits.length) {
+      var h = "<tr><th>exit</th><th>latency</th><th></th></tr>";
+      d.exits.forEach(function (e) {
+        var lat, cls = "";
+        if (e.delay_ms === null || e.delay_ms === undefined) {
+          lat = e.serving ? "carrying traffic" : "no probe yet";
+        } else if (e.delay_ms === 0) { lat = "unreachable"; cls = " class=bad"; }
+        else { lat = e.delay_ms + " ms"; }
+        h += "<tr><td title=\"" + e.tag + "\">" + e.label + "</td><td" + cls + ">"
+           + lat + "</td><td class=sub>" + (e.serving ? "\u2190 serving" : "") + "</td></tr>";
+      });
+      t.innerHTML = h;
+    }
+    if (el("lv-conns")) el("lv-conns").textContent = (d.direct_conns + d.tunnel_conns);
+    if (el("lv-down")) el("lv-down").textContent = bps(d.down_bps);
+    if (el("lv-up")) el("lv-up").textContent = bps(d.up_bps);
+    if (el("lv-age")) el("lv-age").textContent = " \u00b7 live";
+  }
+  function tick() {
+    if (!watching()) { if (el("lv-age")) el("lv-age").textContent = " \u00b7 paused"; return; }
+    fetch("/stats.json", { credentials: "same-origin" })
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (d) { if (d) draw(d); })
+      .catch(function () { /* keep the last good values */ });
+  }
+  function wake() {
+    last = Date.now();
+    if (document.visibilityState === "visible") tick();
+  }
+  ["mousemove", "keydown", "touchstart", "scroll", "click"].forEach(function (ev) {
+    window.addEventListener(ev, function () { last = Date.now(); }, { passive: true });
+  });
+  document.addEventListener("visibilitychange", wake);
+  timer = setInterval(tick, EVERY);
+  tick();
+})();
+</script>"""
+
+
 POLL_SECONDS = int(os.environ.get("FLEET_STATS_INTERVAL", "180"))
 CLASH_BASE = os.environ.get("FLEET_CLASH_URL", "")
 ROUTER_SSH = os.environ.get("FLEET_ROUTER_SSH", "")
+
+
+def _remember_names(sample: dict) -> None:
+    got = ((sample or {}).get("router") or {}).get("outbound_names") or {}
+    if got:
+        with _lock:
+            _name_map.clear()
+            _name_map.update(got)
 
 
 def _poller_loop():
@@ -104,7 +193,9 @@ def _poller_loop():
     while True:
         try:
             if CLASH_BASE:
-                rstats.append(rstats.collect(CLASH_BASE, ROUTER_SSH))
+                sample = rstats.collect(CLASH_BASE, ROUTER_SSH)
+                _remember_names(sample)
+                rstats.append(sample)
         except Exception:                          # noqa: BLE001 - poller must not die
             pass
         time.sleep(max(60, POLL_SECONDS))
@@ -277,9 +368,10 @@ class Handler(BaseHTTPRequestHandler):
         sys.stderr.write("  %s %s\n" % (self.address_string(), fmt % a))
 
     # ------------------------------------------------------------- helpers
-    def _send(self, body: bytes, code: int = 200, cookie: str | None = None):
+    def _send(self, body: bytes, code: int = 200, cookie: str | None = None,
+              ctype: str = "text/html; charset=utf-8"):
         self.send_response(code)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
@@ -328,6 +420,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(self._stats_page())
         if path == "/settings":
             return self._send(self._settings_page())
+        if path == "/stats.json":
+            return self._send(self._stats_json(), ctype="application/json")
         if path == "/import":
             return self._send(self._import_page())
         self._send(page("not found", "<h1>not found</h1>"), 404)
@@ -474,6 +568,61 @@ class Handler(BaseHTTPRequestHandler):
             f"<td class=sub>{rstats.human_bytes(r['bytes'])}</td></tr>"
             for r in rows) + "</table>"
 
+    def _stats_json(self) -> bytes:
+        """Live numbers for the page to poll. Deliberately CHEAP.
+
+        Only the Clash API is touched — plain HTTP to sing-box on the LAN, a few
+        milliseconds. The SSH-backed probe (DNS settings, nft rules, podkop
+        version, the outbound name map) is left to the slow poller, because an
+        SSH handshake every few seconds against a small router is real load for
+        data that changes hourly at most.
+
+        Throughput is computed here rather than read: Clash exposes cumulative
+        byte counters, so a rate needs two samples. A counter that went backwards
+        means sing-box restarted, and that interval is dropped rather than
+        reported as a negative or an enormous spike.
+        """
+        now = time.time()
+        try:
+            cur = rstats.clash_snapshot(CLASH_BASE) if CLASH_BASE else {}
+            hosts = rstats.live_hosts(CLASH_BASE) if CLASH_BASE else {"direct": [], "tunnel": []}
+        except Exception:                            # noqa: BLE001 - never 500 the page
+            cur, hosts = {}, {"direct": [], "tunnel": []}
+
+        with _lock:
+            names = dict(_name_map)
+            prev = dict(_live_prev)
+            _live_prev.update(t=now, up=cur.get("up_total", 0), dn=cur.get("down_total", 0))
+
+        up_bps = dn_bps = None
+        dt = now - prev.get("t", 0) if prev else 0
+        if prev and 0 < dt < 600:
+            du = cur.get("up_total", 0) - prev.get("up", 0)
+            dd = cur.get("down_total", 0) - prev.get("dn", 0)
+            if du >= 0 and dd >= 0:                  # negative => sing-box restarted
+                up_bps, dn_bps = du * 8 / dt, dd * 8 / dt
+
+        sel = cur.get("selected", "")
+        out = {
+            "t": int(now),
+            "reachable": cur.get("reachable", False),
+            "selected": sel,
+            "selected_label": names.get(sel, sel),
+            "exits": [{"tag": e["name"], "label": names.get(e["name"], e["name"]),
+                       "delay_ms": e.get("delay_ms"),
+                       "serving": e["name"] == sel} for e in cur.get("exits", [])],
+            "direct_conns": cur.get("direct_conns", 0),
+            "tunnel_conns": cur.get("tunnel_conns", 0),
+            "direct_bytes": cur.get("direct_bytes", 0),
+            "tunnel_bytes": cur.get("tunnel_bytes", 0),
+            "up_bps": up_bps, "down_bps": dn_bps,
+            # Hostnames are rendered and discarded, never written to disk — a
+            # rolling log of everything the household visits is the artefact this
+            # project exists to avoid.
+            "hosts": hosts,
+        }
+        return json.dumps(out).encode()
+
     def _stats_page(self) -> bytes:
         rows = rstats.load()
         cur = rows[-1] if rows else {}
@@ -494,13 +643,26 @@ class Handler(BaseHTTPRequestHandler):
         ex = []
         for e in cur.get("exits", []):
             ms = e.get("delay_ms")
-            # Clash reports a failed probe as 0, not as an error.
-            lat = "unreachable" if not ms else f"{ms} ms"
-            mark = " &larr; serving" if e["name"] == sel else ""
-            cls = "" if ms else ' class=bad'
-            ex.append(f"<tr><td>{html.escape(e['name'])}</td>"
+            serving = e["name"] == sel
+            # THREE states, not two. `None` means sing-box has recorded no probe
+            # for this outbound; `0` means a probe ran and failed. Collapsing them
+            # with `if not ms` reported a healthy, traffic-carrying exit as
+            # "unreachable" — a false alarm that cost real debugging time, because
+            # the panel was contradicting the fact that the internet plainly worked.
+            if ms is None:
+                lat = "carrying traffic" if serving else "no probe yet"
+                cls = ""
+            elif ms == 0:
+                lat, cls = "unreachable", " class=bad"
+            else:
+                lat, cls = f"{ms} ms", ""
+            mark = " &larr; serving" if serving else ""
+            # The friendly name if router_stats could resolve one, else the tag.
+            shown = e.get("label") or e["name"]
+            title = f' title="{html.escape(e["name"])}"' if shown != e["name"] else ""
+            ex.append(f"<tr><td{title}>{html.escape(shown)}</td>"
                       f"<td{cls}>{lat}</td><td class=sub>{mark}</td></tr>")
-        extable = ("<table><tr><th>exit</th><th>latency</th><th></th></tr>"
+        extable = ("<table id=extable><tr><th>exit</th><th>latency</th><th></th></tr>"
                    + "".join(ex) + "</table>") if ex else "<div class=sub>no exits</div>"
 
         # --- throughput --------------------------------------------------------
@@ -572,14 +734,15 @@ avoid.</div>
 <h2>tunnel</h2>
 {extable}
 <div class=sub style="margin-top:6px">active connections:
-<b>{cur.get('conns', 0)}</b></div>
+<b id=lv-conns>{cur.get('conns', 0)}</b>
+<span class=sub id=lv-age></span></div>
 
 <h2>throughput</h2>
 <table>
 <tr><td>down</td><td>{down_sp}</td>
-    <td>{rstats.human_bps(last.get('down_bps', 0))}</td></tr>
+    <td id=lv-down>{rstats.human_bps(last.get('down_bps', 0))}</td></tr>
 <tr><td>up</td><td>{up_sp}</td>
-    <td>{rstats.human_bps(last.get('up_bps', 0))}</td></tr>
+    <td id=lv-up>{rstats.human_bps(last.get('up_bps', 0))}</td></tr>
 </table>
 <div class=sub>transferred in this window:
 {rstats.human_bytes(win_dn)} down / {rstats.human_bytes(win_up)} up
@@ -588,6 +751,8 @@ avoid.</div>
 
 <h2>split — what goes where</h2>
 {split_block}
+
+{LIVE_JS}
 
 <h2>podkop &amp; DNS</h2>
 <table>

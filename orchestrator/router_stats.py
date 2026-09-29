@@ -163,7 +163,13 @@ def router_probe(ssh_target: str, ssh_key: str = "") -> dict:
         "ps w | grep -c '[d]nsproxy'; "
         "uci -q get podkop.settings.dns_type; "
         "uci -q get podkop.settings.dns_server; "
-        "podkop show_version 2>/dev/null | head -1"
+        "podkop show_version 2>/dev/null | head -1; "
+        # The exit list, in the order podkop feeds it to sing-box. That order IS
+        # the outbound numbering: index N becomes `main-N-out`. Verified against a
+        # live router by pinning a tag via the Clash API and watching which exit
+        # the traffic actually left from.
+        "uci -q get podkop.main.urltest_proxy_links; "
+        "uci -q get podkop.main.proxy_string"
     )
     try:
         r = subprocess.run(cmd + [ssh_target, remote], capture_output=True,
@@ -183,13 +189,48 @@ def router_probe(ssh_target: str, ssh_key: str = "") -> dict:
             return ""
     out.update(ok=r.returncode == 0, singbox=_i(0), nft_rules=_i(1),
                dnsproxy=_i(2), dns_type=_s(3), dns_server=_s(4), podkop=_s(5))
+    out["outbound_names"] = _outbound_names(_s(6) + " " + _s(7))
     return out
+
+
+def _outbound_names(uri_blob: str) -> dict[str, str]:
+    """Map sing-box's `main-N-out` tags to the exit names they actually are.
+
+    podkop numbers outbounds by position in its URI list and throws the `#fragment`
+    away, so the Clash API reports `main-1-out` where a human wants
+    `exit-hetzne-sin-6ae24d`. The fragment we generate is `<exit-name>-<client>`,
+    so the exit name is everything before the last dash.
+
+    Falls back to `host:port` when a URI has no fragment, and to the bare tag when
+    there is nothing at all — a missing label must never hide a live exit from the
+    panel.
+    """
+    import re as _re
+    from urllib.parse import unquote as _unq, urlparse as _up
+
+    names: dict[str, str] = {}
+    for i, uri in enumerate(_re.findall(r"vless://[^\s'\"]+", uri_blob or ""), start=1):
+        tag = f"main-{i}-out"
+        frag = _unq(_up(uri).fragment or "")
+        if frag:
+            names[tag] = frag.rsplit("-", 1)[0] if "-" in frag else frag
+        else:
+            p = _up(uri)
+            names[tag] = f"{p.hostname or '?'}:{p.port or '?'}"
+    return names
 
 
 def collect(clash_base: str, ssh_target: str, ssh_key: str = "") -> dict:
     s = {"t": int(time.time())}
     s.update(clash_snapshot(clash_base))
     s["router"] = router_probe(ssh_target, ssh_key)
+
+    # Attach human names to the outbound tags, so the panel can say
+    # "exit-upclou-sg-sin1-b8df9c" instead of "main-2-out".
+    names = (s["router"] or {}).get("outbound_names") or {}
+    for e in s.get("exits", []):
+        e["label"] = names.get(e["name"], e["name"])
+    s["selected_label"] = names.get(s.get("selected", ""), s.get("selected", ""))
     return s
 
 
