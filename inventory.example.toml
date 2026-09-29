@@ -216,7 +216,17 @@ regions           = ["sin"]
 server_type       = "cpx11"
 image             = "debian-13"
 reality_dest = "www.grab.com:443"
-reality_sni  = "www.grab.com"
+# A LIST makes fleet pick one per exit, so successive exits do not share a masking
+# identity. `dest` is derived from whichever is drawn — they must agree, or an
+# unauthenticated probe gets a certificate for the wrong name.
+# Vet every entry from YOUR line: it needs TLS 1.3 and a non-error response, since
+# REALITY proxies probes to it and a 403 hands them a block page instead of a site.
+reality_sni  = ["www.grab.com", "www.straitstimes.com", "www.shopee.sg",
+                "www.samsung.com", "www.lazada.sg", "www.nintendo.co.jp",
+                "www.rakuten.co.jp", "www.asus.com", "www.lg.com",
+                "www.lovelive-anime.jp",
+                "cdn.jsdelivr.net", "cdnjs.cloudflare.com", "unpkg.com",
+                "www.apple.com", "login.microsoftonline.com"]
 
 # UpCloud — AS202053, on neither RKN list as of 2026-09, Singapore zone (no Moscow
 # transit from the Far East), and payable with an ordinary card. Credential is
@@ -296,5 +306,42 @@ regions      = ["sg-sin1"]
 server_type  = "DEV-1xCPU-1GB-10GB"
 image        = "debian-13"
 reality_dest = "www.grab.com:443"
+# Fifteen hosts, so successive exits rarely repeat a masking identity. Each was
+# measured FROM THE RUSSIAN LINE 2026-09-29 (control: the probing box egressed
+# 5.143.x, the bare ISP, not our own tunnel) for TLS 1.3 and a non-error response.
+#
+# Deliberately mixed in kind, because the fundamental REALITY tell is that our IP
+# is not in the claimed domain's AS:
+#   * CDN / infra hosts are GEOGRAPHICALLY AGNOSTIC — an unfamiliar IP answering
+#     for a CDN edge is unremarkable, where an unfamiliar IP answering for a
+#     single-origin site is not. They also receive sustained repeat connections
+#     from one client, which matches a tunnel's profile far better than a news
+#     site does.
+#   * regional commerce/news hosts stay plausible for an APAC exit.
+#
+# Rejected, and why — do not re-add without re-measuring:
+#   www.microsoft.com             unreachable from RU (000)
+#   static.cloudflareinsights.com unreachable from RU
+#   aidata.ru                     unreachable, and no TLS 1.3
+#   gateway.icloud.com            400 to a bare GET
+#   init.itunes.apple.com         400 to a bare GET
+#   www.reddit.com                reachable, but politically salient in RU: an SNI
+#                                 the censor may act on is the opposite of cover
+#   adriver.ru / ad.adriver.ru    reachable, but a .ru SNI on a foreign exit is a
+#                                 geography mismatch in the WORST direction — TSPU
+#                                 is Russian infrastructure and knows precisely
+#                                 where a Russian ad network is hosted
+#
+# www.lovelive-anime.jp is kept deliberately despite answering 403 with a 12 KB
+# block page: in a list this long it is drawn rarely, and variety across the fleet
+# is worth more than every single entry being perfect.
+#
+#   NOTE the SNI is fixed per exit at creation and `dest` is derived from it —
+#   they must agree, or an unauthenticated probe gets a certificate for the wrong
+#   name. Variety comes from many exits over time, not from re-masking one.
 reality_sni  = ["www.grab.com", "www.straitstimes.com", "www.shopee.sg",
-                "www.samsung.com", "www.lovelive-anime.jp"]
+                "www.samsung.com", "www.lazada.sg", "www.nintendo.co.jp",
+                "www.rakuten.co.jp", "www.asus.com", "www.lg.com",
+                "www.lovelive-anime.jp",
+                "cdn.jsdelivr.net", "cdnjs.cloudflare.com", "unpkg.com",
+                "www.apple.com", "login.microsoftonline.com"]
