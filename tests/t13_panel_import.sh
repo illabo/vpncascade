@@ -23,6 +23,19 @@ head1 "t13 — panel config import (offline, no hardware touched)"
 
 command -v python3 >/dev/null 2>&1 || { skip "python3 not available"; summary; exit 0; }
 
+# This project needs Python 3.11+, and the failure mode on an older one is a
+# confusing spray of unrelated test failures rather than a clear message. macOS
+# still ships 3.9 at /usr/bin/python3, so anyone with a restricted PATH lands on
+# it by accident -- which is exactly how this was found: six tests "failed" and
+# the real answer was that two different interpreters were in play.
+PYVER="$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null)"
+case "$PYVER" in
+  3.1[1-9]|3.[2-9][0-9]|[4-9].*) : ;;
+  *)
+    skip "python3 is $PYVER; this project needs 3.11+ (try a newer interpreter on PATH)"
+    summary; exit 0 ;;
+esac
+
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 

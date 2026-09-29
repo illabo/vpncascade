@@ -102,10 +102,6 @@ _name_map: dict[str, str] = {}
 #: real rate. Clash only exposes cumulative counters; a rate needs two samples.
 _live_prev: dict[str, float] = {}
 
-#: When each outbound was last nudged into measuring itself, so an open page does
-#: not re-probe the same gap every five seconds.
-_probe_at: dict[str, float] = {}
-PROBE_EVERY = 60.0
 #: Cloudflare rather than the gstatic default podkop bakes in: measured from this
 #: router at 0.91s against gstatic's 1.79s, and it is not a Google endpoint, which
 #: matters on a line where Google is partially degraded.
@@ -213,6 +209,45 @@ def _remember_names(sample: dict) -> None:
             _name_map.update(got)
 
 
+def fill_probe_gaps(exits: list) -> None:
+    """Ask sing-box to measure any outbound it has never measured.
+
+    urltest stops probing once it finds a member that is good enough, so a healthy
+    exit can sit permanently unmeasured — and urltest keeps selecting a slower one
+    because it never looked at the alternative. Observed here: 445 ms unprobed
+    against 614 ms selected, a 27% penalty paid purely because nothing had asked.
+
+    **Called from the scheduled poller only, never from a page view.** Two reasons.
+    A panel is a viewer: opening it must not generate traffic at the router, or
+    leaving a tab open turns into an unbounded probe source. And every probe is a
+    small, fixed-size, regularly-timed flow to an exit — exactly the beacon shape
+    traffic analysis looks for — so the rate must be bounded by a schedule we set,
+    not by how often somebody refreshes a browser.
+
+    Only fills genuine gaps. Outbounds that already have a measurement are left
+    alone, so this can never oscillate a choice between two exits that urltest has
+    already compared.
+    """
+    import threading
+
+    todo = [e.get("name") for e in exits
+            if e.get("delay_ms") is None and e.get("name")]
+    if not todo or not CLASH_BASE:
+        return
+
+    def _probe(tag: str) -> None:
+        try:
+            rstats._get_json(
+                f"{CLASH_BASE}/proxies/{quote(tag)}/delay"
+                f"?timeout=8000&url={quote(PROBE_URL, safe='')}"
+            )
+        except Exception:                            # noqa: BLE001 - best effort
+            pass
+
+    for tag in todo:
+        threading.Thread(target=_probe, args=(tag,), daemon=True).start()
+
+
 def _poller_loop():
     """Sample the router forever. Never let a failure kill the thread — a panel
     that stops updating silently is worse than one showing stale numbers."""
@@ -222,6 +257,8 @@ def _poller_loop():
                 sample = rstats.collect(CLASH_BASE, ROUTER_SSH)
                 _remember_names(sample)
                 rstats.append(sample)
+                # Once per cycle, and only for outbounds urltest never measured.
+                fill_probe_gaps(sample.get("exits", []))
         except Exception:                          # noqa: BLE001 - poller must not die
             pass
         time.sleep(max(60, POLL_SECONDS))
@@ -252,23 +289,57 @@ def pw_path(sd: str) -> str:
     return os.path.join(sd, "web-password")
 
 
+#: `hashlib.scrypt` needs a Python linked against OpenSSL. macOS system Python is
+#: built against LibreSSL 2.8.3 and simply does not have it, so calling it raised
+#: AttributeError and took the whole panel down — on that interpreter the password
+#: could be neither set nor checked. PBKDF2 is always present, so it is the
+#: fallback. 600k iterations of SHA-256 is the current OWASP guidance.
+HAVE_SCRYPT = hasattr(hashlib, "scrypt")
+PBKDF2_ROUNDS = 600_000
+
+
+def _derive(password: str, salt: bytes, algo: str) -> str:
+    if algo == "scrypt":
+        if not HAVE_SCRYPT:
+            raise RuntimeError(
+                "this password was hashed with scrypt, but this Python has no "
+                "hashlib.scrypt (it is not linked against OpenSSL). Run the panel "
+                "on the same interpreter that set the password, or reset it with "
+                "--set-password."
+            )
+        return hashlib.scrypt(password.encode(), salt=salt,
+                              n=2**14, r=8, p=1, dklen=32).hex()
+    return hashlib.pbkdf2_hmac("sha256", password.encode(), salt,
+                               PBKDF2_ROUNDS, dklen=32).hex()
+
+
 def set_password(sd: str, password: str) -> None:
     salt = secrets.token_bytes(16)
-    dk = hashlib.scrypt(password.encode(), salt=salt, n=2**14, r=8, p=1, dklen=32)
+    algo = "scrypt" if HAVE_SCRYPT else "pbkdf2"
+    dk = _derive(password, salt, algo)
     os.makedirs(sd, exist_ok=True)
     with open(pw_path(sd), "w") as fh:
-        fh.write(salt.hex() + ":" + dk.hex())
+        # Tagged, so a file written by one build is still readable by another.
+        fh.write(f"{algo}${salt.hex()}${dk}")
     os.chmod(pw_path(sd), 0o600)
 
 
 def check_password(sd: str, password: str) -> bool:
     try:
-        salt_hex, dk_hex = open(pw_path(sd)).read().strip().split(":")
-    except Exception:
+        raw = open(pw_path(sd)).read().strip()
+    except Exception:                                # noqa: BLE001
         return False
-    dk = hashlib.scrypt(password.encode(), salt=bytes.fromhex(salt_hex),
-                        n=2**14, r=8, p=1, dklen=32)
-    return hmac.compare_digest(dk.hex(), dk_hex)
+    try:
+        if "$" in raw:
+            algo, salt_hex, dk_hex = raw.split("$", 2)
+        else:
+            # Pre-tag format was always scrypt. Keep reading it, so upgrading the
+            # panel never locks anybody out of a password they already set.
+            algo, (salt_hex, dk_hex) = "scrypt", raw.split(":")
+        return hmac.compare_digest(_derive(password, bytes.fromhex(salt_hex), algo),
+                                   dk_hex)
+    except Exception:                                # noqa: BLE001
+        return False
 
 
 def sign(secret: bytes, value: str) -> str:
@@ -594,48 +665,6 @@ class Handler(BaseHTTPRequestHandler):
             f"<td class=sub>{rstats.human_bytes(r['bytes'])}</td></tr>"
             for r in rows) + "</table>"
 
-    @staticmethod
-    def _fill_probe_gaps(exits: list) -> None:
-        """Ask sing-box to measure any outbound it has never measured.
-
-        urltest stops probing once it finds a member that is good enough, so a
-        healthy exit can sit permanently at "no probe yet" — and, worse, urltest
-        keeps selecting a slower exit because it never looked at the faster one.
-        Observed on this fleet: the unprobed exit measured 452 ms against the
-        selected one's 631 ms.
-
-        Filling the gap also feeds urltest the data it needs to reconsider. Costs
-        one request per unmeasured outbound, at most once a minute each, and ONLY
-        while somebody has the stats page open, since the page is what calls it.
-        Fired in the background so the response stays fast; the next poll shows
-        the value.
-        """
-        import threading
-
-        now = time.time()
-        todo = []
-        with _lock:
-            for e in exits:
-                if e.get("delay_ms") is not None:
-                    continue
-                tag = e.get("name", "")
-                if not tag or now - _probe_at.get(tag, 0) < PROBE_EVERY:
-                    continue
-                _probe_at[tag] = now
-                todo.append(tag)
-
-        def _probe(tag: str) -> None:
-            try:
-                rstats._get_json(
-                    f"{CLASH_BASE}/proxies/{quote(tag)}/delay"
-                    f"?timeout=8000&url={quote(PROBE_URL, safe='')}"
-                )
-            except Exception:                        # noqa: BLE001 - best effort
-                pass
-
-        for tag in todo:
-            threading.Thread(target=_probe, args=(tag,), daemon=True).start()
-
     def _stats_json(self) -> bytes:
         """Live numbers for the page to poll. Deliberately CHEAP.
 
@@ -671,8 +700,6 @@ class Handler(BaseHTTPRequestHandler):
                 up_bps, dn_bps = du * 8 / dt, dd * 8 / dt
 
         sel = cur.get("selected", "")
-        if CLASH_BASE:
-            self._fill_probe_gaps(cur.get("exits", []))
         # The age of the last STORED sample (the 3-minute SSH-backed one), plus the
         # server's own clock. The page ticks the counter locally between polls but
         # re-baselines from these, so it can never drift or depend on the browser's
