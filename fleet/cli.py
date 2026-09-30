@@ -6,6 +6,7 @@ import json
 import os
 import shlex
 import shutil
+import subprocess
 import sys
 
 from . import asn as asnmod
@@ -264,11 +265,19 @@ def cmd_subscription(args) -> int:
         return 1
     for c in targets:
         payload = render.subscription(inv, state, c)
+        n = len(render.client_uris(inv, state, c))
+        if args.out == "-":
+            # stdout, so it can be piped straight into qrencode/pbcopy without
+            # leaving a copy of working credentials lying around in state/.
+            print(payload)
+            continue
         path = args.out or os.path.join(inv.state_dir, f"sub-{c['name']}.txt")
         with open(path, "w") as fh:
             fh.write(payload + "\n")
         os.chmod(path, 0o600)
-        ok(f"{c['name']}: {len(render.client_uris(inv, state, c))} server(s) → {path}")
+        ok(f"{c['name']}: {n} server(s) → {path}")
+    if args.out == "-":
+        return 0
     print("\n  Host these files somewhere your clients can fetch over HTTPS, then point\n"
           "  v2rayTun / Happ / NekoBox / podkop at the URL. `fleet rotate` rewrites them,\n"
           "  so a rotation stops being a per-device chore.\n"
@@ -335,9 +344,15 @@ def cmd_client_uri(args) -> int:
                   f"all of them so the client can fail over)\033[0m")
         for uri in uris:
             if args.qr and shutil.which("qrencode"):
-                os.system(f"qrencode -t ANSIUTF8 {json.dumps(uri)}")
+                # Through stdin, never argv: a command line is world-readable in
+                # `ps`, and this one would carry the client's UUID.
+                # No string argument: qrencode then reads stdin. Not `-r -`,
+                # which it rejects with "Cannot read input file -."
+                subprocess.run(["qrencode", "-t", "ANSIUTF8"],
+                               input=uri.encode(), check=False)
             elif args.qr:
-                warn("qrencode not installed (brew install qrencode) — printing the URI")
+                warn("qrencode not installed — printing the URI instead.\n"
+                     "  macOS: brew install qrencode   Debian/Pi: sudo apt install qrencode")
             print(uri if len(targets) == 1 and len(uris) == 1 else f"  {uri}")
     if not inv.cascade:
         print("\n  \033[2mThese addresses change when exits rotate. `fleet subscription`\n"
@@ -802,7 +817,9 @@ def build_parser() -> argparse.ArgumentParser:
     sb = sub.add_parser("subscription",
                         help="write subscription payloads so clients follow rotation")
     sb.add_argument("name", nargs="?")
-    sb.add_argument("-o", "--out")
+    sb.add_argument("-o", "--out",
+                    help='file to write (default state/sub-<name>.txt), '
+                         'or "-" for stdout')
     sb.set_defaults(fn=cmd_subscription)
 
     u = sub.add_parser("up", help="bring the exit pool to its configured size")

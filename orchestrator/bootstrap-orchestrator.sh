@@ -45,9 +45,10 @@ esac
 step "packages"
 sh_ "sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq" >/dev/null
 sh_ "sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
-     openssh-client curl ca-certificates rsync dnsmasq stubby bind9-dnsutils" >/dev/null
-ok "installed: openssh-client curl rsync dnsmasq stubby bind9-dnsutils"
+     openssh-client curl ca-certificates rsync dnsmasq stubby bind9-dnsutils qrencode" >/dev/null
+ok "installed: openssh-client curl rsync dnsmasq stubby bind9-dnsutils qrencode"
 note "bind9-dnsutils provides dig, which tests/t11_dns_integrity.sh needs"
+note "qrencode is what \`fleet client uri --qr\` shells out to; without it that flag silently degrades to printing the URI"
 
 step "protecting the SD card"
 # An SD card dies from writes, and the two biggest writers on a default install are

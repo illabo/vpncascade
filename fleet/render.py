@@ -294,9 +294,12 @@ def exit_config(inv: Inventory, node: dict, clients: list[dict] | None = None) -
     credentials live in state and are re-pushed to every new exit — verified against a
     live fleet, where one client UUID outlived several exit rotations. So a UUID taken
     from a seized or hostile exit stays valid on every *future* exit too. The only
-    thing that invalidates it is `fleet client revoke <name>`, which re-keys that
-    client and pushes the change to the pool. Rotate exits to change your addresses;
-    revoke clients to change your credentials. They are separate operations.
+    thing that invalidates it is `fleet client revoke <name>`, which DELETES the
+    client and re-syncs the pool without it. It does not re-key: there is no
+    rotate-this-credential operation, so giving a device a fresh UUID means
+    `revoke` then `add` under the same name, and re-issuing its share link.
+    Rotate exits to change your addresses; revoke clients to change your
+    credentials. They are separate operations.
     """
     tr = node.get("transport", "xhttp")
     if inv.cascade:

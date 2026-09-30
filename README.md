@@ -42,6 +42,11 @@ and the mistakes already made so they are not repeated.
 step-by-step, and [`docs/08-software-overview.md`](docs/08-software-overview.md)
 explains what each component does plus a `fleet` reference.
 
+**Getting a device connected?** [`docs/10-clients.md`](docs/10-clients.md) covers the
+three export formats and which to use, what a client credential actually is, what
+revokes it (rotation does not), phones and which apps handle VLESS+REALITY, and what
+the config import does.
+
 **Start here:** [`docs/01-research-findings.md`](docs/01-research-findings.md) answers
 the "is there a unified multi-VPS API" and "what can the Beryl actually run" questions.
 [`docs/02-architecture.md`](docs/02-architecture.md) explains the topology and reviews

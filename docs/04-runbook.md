@@ -198,6 +198,9 @@ and "save", which quietly costs money.
 ./bin/fleet client uri laptop --qr
 ```
 
+Credentials, the three export formats, phones, and what `revoke` does and does not do:
+[`10-clients.md`](10-clients.md).
+
 ### Revoke a device
 
 ```bash
