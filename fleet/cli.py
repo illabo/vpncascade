@@ -5,6 +5,7 @@ import argparse
 import json
 import os
 import shlex
+import collections
 import shutil
 import subprocess
 import sys
@@ -65,6 +66,19 @@ def cmd_init(args) -> int:
     return 0
 
 
+def _dest_host(node: dict) -> str:
+    """The hostname out of `reality_dest`, which is stored as host:port."""
+    d = node.get("reality_dest") or ""
+    return d.rsplit(":", 1)[0] if ":" in d else d
+
+
+def _sni_cell(node: dict) -> str:
+    """The masking identity, flagged when it disagrees with dest."""
+    sni = node.get("reality_sni") or "—"
+    dest = _dest_host(node)
+    return f"{sni} !=dest" if (dest and sni != "—" and dest != sni) else sni
+
+
 def cmd_status(args) -> int:
     inv, state = _load(args)
     print(f"\n\033[1m{BANNER}\033[0m")
@@ -97,15 +111,35 @@ def cmd_status(args) -> int:
             "ip": n["ipv4"], "port": n["port"], "age": human_age(n["created_at"]),
             "status": n["status"], "serving": "yes" if n.get("serving") else "-",
             "asn": (f"AS{n['asn']}" if n.get("asn") else "?"),
+            # The identity the node presents to anyone who connects. Grouped with
+            # ip/asn because these three are what an outside observer actually sees.
+            "sni": _sni_cell(n),
         }
         for n in state.exits
     ]
-    print(_table(rows, ["name", "provider", "region", "ip", "asn", "age", "status",
-                        "serving"]))
+    print(_table(rows, ["name", "provider", "region", "ip", "asn", "sni", "age",
+                        "status", "serving"]))
     distinct = {n.get("asn") for n in state.exits if n.get("asn")}
     if len(state.exits) > 1 and len(distinct) < 2:
         print("\n  \033[33mAll exits share one ASN — a single sweep takes the whole "
               "pool. Add a provider on a different ASN.\033[0m")
+
+    # A node whose sni does not match its dest serves a certificate for the wrong
+    # name. That is remotely checkable by anyone who connects, and it is the exact
+    # tell REALITY exists to avoid, so it is worth more than a quiet column.
+    bad = [n for n in state.exits if _dest_host(n) and n.get("reality_sni")
+           and _dest_host(n) != n["reality_sni"]]
+    for n in bad:
+        print(f"\n  \033[33m{n['name']}: sni is {n['reality_sni']} but dest is "
+              f"{_dest_host(n)} — a probe gets a certificate for the wrong name. "
+              f"Redeploy this exit.\033[0m")
+
+    dup = collections.Counter(n["reality_sni"] for n in state.serving_exits()
+                              if n.get("reality_sni"))
+    for sni, c in dup.items():
+        if c > 1:
+            print(f"\n  \033[33m{c} serving exits both mask as {sni} — "
+                  f"that correlates them. Widen reality_sni in inventory.toml.\033[0m")
 
     print(f"\n\033[1mCLIENTS\033[0m  ({len(state.clients)})")
     print(_table(
